@@ -112,68 +112,69 @@ pipeline:
             spec: {}
           execution:
             steps:
-              - step:
-                  type: Run
-                  name: Check Sonar Token
-                  identifier: check_sonar_token
-                  timeout: 5m
-                  spec:
-                    connectorRef: subdenadocker
-                    image: python:3.12-slim
-                    shell: Python
-                    envVariables:
-                      SONAR_TOKEN: <+secrets.getValue("sonarqube")>
-                      SONAR_HOST: <+pipeline.variables.sonar_host>
-                      SONAR_ORG: <+pipeline.variables.sonar_organization>
-                    command: |
-                      # Diagnoses the exact token the pipeline receives - never prints it.
-                      import base64, json, os, sys, urllib.request
+              - parallel:
+                  - step:
+                      type: Run
+                      name: Check Sonar Token
+                      identifier: check_sonar_token
+                      timeout: 5m
+                      spec:
+                        connectorRef: subdenadocker
+                        image: python:3.12-slim
+                        shell: Python
+                        envVariables:
+                          SONAR_TOKEN: <+secrets.getValue("sonarqube")>
+                          SONAR_HOST: <+pipeline.variables.sonar_host>
+                          SONAR_ORG: <+pipeline.variables.sonar_organization>
+                        command: |
+                          # Diagnoses the exact token the pipeline receives - never prints it.
+                          import base64, json, os, sys, urllib.request
 
-                      raw = os.environ.get("SONAR_TOKEN", "")
-                      host = os.environ["SONAR_HOST"].rstrip("/")
-                      org = os.environ["SONAR_ORG"]
+                          raw = os.environ.get("SONAR_TOKEN", "")
+                          host = os.environ["SONAR_HOST"].rstrip("/")
+                          org = os.environ["SONAR_ORG"]
 
-                      print(f"Token length: {len(raw)}")
-                      print(f"Leading/trailing whitespace: {raw != raw.strip()}")
-                      if not raw.strip():
-                          print("FATAL: SONAR_TOKEN is EMPTY - Harness secret 'sonarqube' resolved to nothing.")
-                          sys.exit(1)
+                          print(f"Token length: {len(raw)}")
+                          print(f"Leading/trailing whitespace: {raw != raw.strip()}")
+                          if not raw.strip():
+                              print("FATAL: SONAR_TOKEN is EMPTY - Harness secret 'sonarqube' resolved to nothing.")
+                              sys.exit(1)
 
-                      tok = raw.strip()
-                      auth = base64.b64encode(f"{tok}:".encode()).decode()
+                          tok = raw.strip()
+                          auth = base64.b64encode(f"{tok}:".encode()).decode()
 
-                      def api(path):
-                          req = urllib.request.Request(host + path)
-                          req.add_header("Authorization", "Basic " + auth)
-                          with urllib.request.urlopen(req, timeout=30) as r:
-                              return json.load(r)
+                          def api(path):
+                              req = urllib.request.Request(host + path)
+                              req.add_header("Authorization", "Basic " + auth)
+                              with urllib.request.urlopen(req, timeout=30) as r:
+                                  return json.load(r)
 
-                      v = api("/api/authentication/validate")
-                      print(f"Token valid: {v.get('valid')}")
-                      if not v.get("valid"):
-                          print("FATAL: SonarCloud rejects this token - the secret holds a different token than the one verified on the VM.")
-                          sys.exit(1)
+                          v = api("/api/authentication/validate")
+                          print(f"Token valid: {v.get('valid')}")
+                          if not v.get("valid"):
+                              print("FATAL: SonarCloud rejects this token - the secret holds a different token than the one verified on the VM.")
+                              sys.exit(1)
 
-                      orgs = api("/api/organizations/search?member=true")
-                      keys = [o["key"] for o in orgs.get("organizations", [])]
-                      print(f"Token's organizations: {keys}")
-                      if org not in keys:
-                          print(f"FATAL: token valid but its account is NOT a member of '{org}'.")
-                          sys.exit(1)
+                          orgs = api("/api/organizations/search?member=true")
+                          keys = [o["key"] for o in orgs.get("organizations", [])]
+                          print(f"Token's organizations: {keys}")
+                          if org not in keys:
+                              print(f"FATAL: token valid but its account is NOT a member of '{org}'.")
+                              sys.exit(1)
 
-                      print(f"PREFLIGHT OK: token valid and member of '{org}'.")
-              - step:
-                  type: Run
-                  name: Build With Coverage
-                  identifier: build_with_coverage
-                  timeout: 15m
-                  spec:
-                    connectorRef: subdenadocker
-                    image: maven:3.9.8-eclipse-temurin-17
-                    shell: Sh
-                    command: mvn -B -ntp -f healthcare-microservices/<+matrix.service>/pom.xml org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent verify org.jacoco:jacoco-maven-plugin:0.8.12:report
-                    envVariables:
-                      MAVEN_OPTS: "-Dmaven.repo.local=/root/.m2/repository"
+                          print(f"PREFLIGHT OK: token valid and member of '{org}'.")
+                  - step:
+                      type: Run
+                      name: Build With Coverage
+                      identifier: build_with_coverage
+                      timeout: 15m
+                      spec:
+                        connectorRef: subdenadocker
+                        image: maven:3.9.8-eclipse-temurin-17
+                        shell: Sh
+                        command: mvn -B -ntp -f healthcare-microservices/<+matrix.service>/pom.xml org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent verify org.jacoco:jacoco-maven-plugin:0.8.12:report
+                        envVariables:
+                          MAVEN_OPTS: "-Dmaven.repo.local=/root/.m2/repository"
               - step:
                   type: Run
                   name: Upload To SonarCloud
