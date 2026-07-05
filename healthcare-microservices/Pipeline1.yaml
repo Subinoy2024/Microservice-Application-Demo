@@ -4,12 +4,11 @@ pipeline:
   projectIdentifier: HealthAPP
   orgIdentifier: default
   description: |
-    Stage 1: Unit tests (Maven, declarative)
-    Stage 2: SonarQube scan (Maven) + Quality Gate check (Python via SonarQube REST API)
-    Stage 3: Docker build & push (Harness native step, fully declarative)
+    Granular CI: compile -> unit test -> token preflight -> build with
+    coverage -> SonarCloud upload -> quality gate -> docker build & push.
   tags:
     app: healthcare-microservices
-    style: declarative-python
+    style: granular-steps
   properties:
     ci:
       codebase:
@@ -59,9 +58,21 @@ pipeline:
             steps:
               - step:
                   type: Run
-                  name: Maven Unit Tests
-                  identifier: maven_unit_tests
-                  timeout: 20m
+                  name: Compile Code
+                  identifier: compile_code
+                  timeout: 10m
+                  spec:
+                    connectorRef: subdenadocker
+                    image: maven:3.9.8-eclipse-temurin-17
+                    shell: Sh
+                    command: mvn -B -ntp compile -f healthcare-microservices/<+matrix.service>/pom.xml
+                    envVariables:
+                      MAVEN_OPTS: "-Dmaven.repo.local=/root/.m2/repository"
+              - step:
+                  type: Run
+                  name: Run Unit Tests
+                  identifier: run_unit_tests
+                  timeout: 15m
                   spec:
                     connectorRef: subdenadocker
                     image: maven:3.9.8-eclipse-temurin-17
@@ -103,9 +114,71 @@ pipeline:
             steps:
               - step:
                   type: Run
-                  name: Maven Sonar Scan
-                  identifier: maven_sonar_scan
-                  timeout: 25m
+                  name: Check Sonar Token
+                  identifier: check_sonar_token
+                  timeout: 5m
+                  spec:
+                    connectorRef: subdenadocker
+                    image: python:3.12-slim
+                    shell: Python
+                    envVariables:
+                      SONAR_TOKEN: <+secrets.getValue("sonarqube")>
+                      SONAR_HOST: <+pipeline.variables.sonar_host>
+                      SONAR_ORG: <+pipeline.variables.sonar_organization>
+                    command: |
+                      # Diagnoses the exact token the pipeline receives - never prints it.
+                      import base64, json, os, sys, urllib.request
+
+                      raw = os.environ.get("SONAR_TOKEN", "")
+                      host = os.environ["SONAR_HOST"].rstrip("/")
+                      org = os.environ["SONAR_ORG"]
+
+                      print(f"Token length: {len(raw)}")
+                      print(f"Leading/trailing whitespace: {raw != raw.strip()}")
+                      if not raw.strip():
+                          print("FATAL: SONAR_TOKEN is EMPTY - Harness secret 'sonarqube' resolved to nothing.")
+                          sys.exit(1)
+
+                      tok = raw.strip()
+                      auth = base64.b64encode(f"{tok}:".encode()).decode()
+
+                      def api(path):
+                          req = urllib.request.Request(host + path)
+                          req.add_header("Authorization", "Basic " + auth)
+                          with urllib.request.urlopen(req, timeout=30) as r:
+                              return json.load(r)
+
+                      v = api("/api/authentication/validate")
+                      print(f"Token valid: {v.get('valid')}")
+                      if not v.get("valid"):
+                          print("FATAL: SonarCloud rejects this token - the secret holds a different token than the one verified on the VM.")
+                          sys.exit(1)
+
+                      orgs = api("/api/organizations/search?member=true")
+                      keys = [o["key"] for o in orgs.get("organizations", [])]
+                      print(f"Token's organizations: {keys}")
+                      if org not in keys:
+                          print(f"FATAL: token valid but its account is NOT a member of '{org}'.")
+                          sys.exit(1)
+
+                      print(f"PREFLIGHT OK: token valid and member of '{org}'.")
+              - step:
+                  type: Run
+                  name: Build With Coverage
+                  identifier: build_with_coverage
+                  timeout: 15m
+                  spec:
+                    connectorRef: subdenadocker
+                    image: maven:3.9.8-eclipse-temurin-17
+                    shell: Sh
+                    command: mvn -B -ntp -f healthcare-microservices/<+matrix.service>/pom.xml org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent verify org.jacoco:jacoco-maven-plugin:0.8.12:report
+                    envVariables:
+                      MAVEN_OPTS: "-Dmaven.repo.local=/root/.m2/repository"
+              - step:
+                  type: Run
+                  name: Upload To SonarCloud
+                  identifier: upload_to_sonarcloud
+                  timeout: 15m
                   spec:
                     connectorRef: subdenadocker
                     image: maven:3.9.8-eclipse-temurin-17
@@ -113,11 +186,11 @@ pipeline:
                     envVariables:
                       SONAR_TOKEN: <+secrets.getValue("sonarqube")>
                       MAVEN_OPTS: "-Dmaven.repo.local=/root/.m2/repository"
-                    command: mvn -B -ntp -f healthcare-microservices/<+matrix.service>/pom.xml org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent verify org.jacoco:jacoco-maven-plugin:0.8.12:report org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar -Dsonar.host.url=<+pipeline.variables.sonar_host> -Dsonar.token=$SONAR_TOKEN -Dsonar.organization=<+pipeline.variables.sonar_organization> -Dsonar.projectKey=<+pipeline.variables.sonar_organization>_<+matrix.service> -Dsonar.projectName=<+matrix.service> -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+                    command: mvn -B -ntp -f healthcare-microservices/<+matrix.service>/pom.xml org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar -Dsonar.host.url=<+pipeline.variables.sonar_host> -Dsonar.token=$SONAR_TOKEN -Dsonar.organization=<+pipeline.variables.sonar_organization> -Dsonar.projectKey=<+pipeline.variables.sonar_organization>_<+matrix.service> -Dsonar.projectName=<+matrix.service> -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
               - step:
                   type: Run
-                  name: Quality Gate Check
-                  identifier: quality_gate_check
+                  name: Verify Quality Gate
+                  identifier: verify_quality_gate
                   timeout: 10m
                   spec:
                     connectorRef: subdenadocker
@@ -128,47 +201,40 @@ pipeline:
                       SONAR_HOST: <+pipeline.variables.sonar_host>
                       PROJECT_KEY: <+pipeline.variables.sonar_organization>_<+matrix.service>
                     command: |
-                      # Polls SonarQube's REST API until analysis is processed,
-                      # then fails the pipeline if the Quality Gate is not OK.
+                      # Polls until analysis is processed, then enforces the Quality Gate.
                       import base64, json, os, sys, time, urllib.request
 
-                      host  = os.environ["SONAR_HOST"].rstrip("/")           # SonarQube base URL
-                      key   = os.environ["PROJECT_KEY"]                      # Project key to check
-                      token = os.environ["SONAR_TOKEN"]                      # API token
+                      host  = os.environ["SONAR_HOST"].rstrip("/")
+                      key   = os.environ["PROJECT_KEY"]
+                      token = os.environ["SONAR_TOKEN"].strip()
 
-                      # SonarQube uses HTTP Basic auth with token as username, empty password
                       auth = base64.b64encode(f"{token}:".encode()).decode()
 
                       def api(path):
-                          """GET a SonarQube API path and return parsed JSON."""
                           req = urllib.request.Request(host + path)
                           req.add_header("Authorization", "Basic " + auth)
                           with urllib.request.urlopen(req, timeout=30) as r:
                               return json.load(r)
 
-                      # 1) Wait until SonarQube finishes processing the report (CE queue empty)
-                      for attempt in range(30):                              # up to ~5 minutes
+                      # 1) Wait for SonarCloud to finish processing the report
+                      for attempt in range(30):
                           activity = api(f"/api/ce/component?component={key}")
-                          if not activity.get("queue"):                      # nothing pending for this project
+                          if not activity.get("queue"):
                               break
                           print(f"Analysis still processing... ({attempt + 1}/30)")
                           time.sleep(10)
 
-                      # 2) Fetch the Quality Gate verdict
+                      # 2) Fetch the verdict
                       status = api(f"/api/qualitygates/project_status?projectKey={key}")
-                      gate = status["projectStatus"]["status"]               # OK | ERROR | NONE
+                      gate = status["projectStatus"]["status"]
                       print(f"Quality Gate for {key}: {gate}")
 
-                      # 3) Print each failing condition for readable pipeline logs
+                      # 3) Print each condition for readable logs
                       for cond in status["projectStatus"].get("conditions", []):
                           flag = "PASS" if cond["status"] == "OK" else "FAIL"
                           print(f"  [{flag}] {cond['metricKey']}: actual={cond.get('actualValue')} threshold={cond.get('errorThreshold')}")
 
-                      # 4) Exit logic:
-                      #    OK   -> pass
-                      #    NONE -> first analysis of a new project, no gate computed yet:
-                      #            pass with a warning (next runs will have a real verdict)
-                      #    ERROR/anything else -> fail the pipeline (the gate enforcement)
+                      # 4) Verdict handling
                       if gate == "NONE":
                           print("WARNING: no quality gate computed yet (first analysis) - passing this run.")
                           sys.exit(0)
@@ -198,7 +264,7 @@ pipeline:
             steps:
               - step:
                   type: BuildAndPushDockerRegistry
-                  name: Build and Push Image
+                  name: Build And Push Image
                   identifier: build_push_image
                   timeout: 25m
                   spec:
