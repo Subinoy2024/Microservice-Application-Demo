@@ -1,0 +1,18 @@
+# macOS system files
+.DS_Store
+**/.DS_Store
+
+# Maven build outputs
+**/target/
+target/
+*.jar
+*.war
+*.ear
+
+# IDE / Editor settings
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+.vscode/
