@@ -1,0 +1,212 @@
+pipeline:
+  name: healthcare-microservices-ci
+  identifier: healthapppipeline
+  projectIdentifier: HealthAPP
+  orgIdentifier: default
+  description: |
+    Stage 1: Unit tests (Maven, declarative)
+    Stage 2: SonarQube scan (Maven) + Quality Gate check (Python via SonarQube REST API)
+    Stage 3: Docker build & push (Harness native step, fully declarative)
+  tags:
+    app: healthcare-microservices
+    style: declarative-python
+  properties:
+    ci:
+      codebase:
+        connectorRef: Subinoy2024
+        repoName: Microservice-Application-Demo
+        build: <+input>
+  variables:
+    - name: sonar_host
+      type: String
+      value: <+input>.default(https://sonarcloud.io)
+    - name: sonar_organization
+      type: String
+      value: <+input>.default(subinoy2024)
+    - name: docker_repo_namespace
+      type: String
+      value: <+input>.default(subinoy2024)
+    - name: image_tag
+      type: String
+      value: <+pipeline.sequenceId>-<+codebase.shortCommitSha>
+  stages:
+    - stage:
+        name: Unit Tests
+        identifier: unit_tests
+        type: CI
+        strategy:
+          matrix:
+            service:
+              - appointment-service
+              - doctor-service
+              - patient-service
+              - report-service
+              - user-service
+            maxConcurrency: 2
+        spec:
+          cloneCodebase: true
+          caching:
+            enabled: true
+            paths:
+              - /root/.m2/repository
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Docker
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Maven Unit Tests
+                  identifier: maven_unit_tests
+                  timeout: 20m
+                  spec:
+                    connectorRef: subdenadocker
+                    image: maven:3.9.8-eclipse-temurin-17
+                    shell: Sh
+                    command: mvn -B -ntp test -f healthcare-microservices/<+matrix.service>/pom.xml
+                    reports:
+                      type: JUnit
+                      spec:
+                        paths:
+                          - healthcare-microservices/<+matrix.service>/target/surefire-reports/*.xml
+                    envVariables:
+                      MAVEN_OPTS: "-Dmaven.repo.local=/root/.m2/repository"
+    - stage:
+        name: Sonar Scan And Gate
+        identifier: sonar_scan_gate
+        type: CI
+        strategy:
+          matrix:
+            service:
+              - appointment-service
+              - doctor-service
+              - patient-service
+              - report-service
+              - user-service
+            maxConcurrency: 2
+        spec:
+          cloneCodebase: true
+          caching:
+            enabled: true
+            paths:
+              - /root/.m2/repository
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Docker
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Maven Sonar Scan
+                  identifier: maven_sonar_scan
+                  timeout: 25m
+                  spec:
+                    connectorRef: subdenadocker
+                    image: maven:3.9.8-eclipse-temurin-17
+                    shell: Sh
+                    envVariables:
+                      SONAR_TOKEN: <+secrets.getValue("sonarqube")>
+                      MAVEN_OPTS: "-Dmaven.repo.local=/root/.m2/repository"
+                    command: mvn -B -ntp -f healthcare-microservices/<+matrix.service>/pom.xml org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent verify org.jacoco:jacoco-maven-plugin:0.8.12:report org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar -Dsonar.host.url=<+pipeline.variables.sonar_host> -Dsonar.token=$SONAR_TOKEN -Dsonar.organization=<+pipeline.variables.sonar_organization> -Dsonar.projectKey=<+pipeline.variables.sonar_organization>_<+matrix.service> -Dsonar.projectName=<+matrix.service> -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+              - step:
+                  type: Run
+                  name: Quality Gate Check
+                  identifier: quality_gate_check
+                  timeout: 10m
+                  spec:
+                    connectorRef: subdenadocker
+                    image: python:3.12-slim
+                    shell: Python
+                    envVariables:
+                      SONAR_TOKEN: <+secrets.getValue("sonarqube")>
+                      SONAR_HOST: <+pipeline.variables.sonar_host>
+                      PROJECT_KEY: <+pipeline.variables.sonar_organization>_<+matrix.service>
+                    command: |
+                      # Polls SonarQube's REST API until analysis is processed,
+                      # then fails the pipeline if the Quality Gate is not OK.
+                      import base64, json, os, sys, time, urllib.request
+
+                      host  = os.environ["SONAR_HOST"].rstrip("/")           # SonarQube base URL
+                      key   = os.environ["PROJECT_KEY"]                      # Project key to check
+                      token = os.environ["SONAR_TOKEN"]                      # API token
+
+                      # SonarQube uses HTTP Basic auth with token as username, empty password
+                      auth = base64.b64encode(f"{token}:".encode()).decode()
+
+                      def api(path):
+                          """GET a SonarQube API path and return parsed JSON."""
+                          req = urllib.request.Request(host + path)
+                          req.add_header("Authorization", "Basic " + auth)
+                          with urllib.request.urlopen(req, timeout=30) as r:
+                              return json.load(r)
+
+                      # 1) Wait until SonarQube finishes processing the report (CE queue empty)
+                      for attempt in range(30):                              # up to ~5 minutes
+                          activity = api(f"/api/ce/component?component={key}")
+                          if not activity.get("queue"):                      # nothing pending for this project
+                              break
+                          print(f"Analysis still processing... ({attempt + 1}/30)")
+                          time.sleep(10)
+
+                      # 2) Fetch the Quality Gate verdict
+                      status = api(f"/api/qualitygates/project_status?projectKey={key}")
+                      gate = status["projectStatus"]["status"]               # OK | ERROR | NONE
+                      print(f"Quality Gate for {key}: {gate}")
+
+                      # 3) Print each failing condition for readable pipeline logs
+                      for cond in status["projectStatus"].get("conditions", []):
+                          flag = "PASS" if cond["status"] == "OK" else "FAIL"
+                          print(f"  [{flag}] {cond['metricKey']}: actual={cond.get('actualValue')} threshold={cond.get('errorThreshold')}")
+
+                      # 4) Exit logic:
+                      #    OK   -> pass
+                      #    NONE -> first analysis of a new project, no gate computed yet:
+                      #            pass with a warning (next runs will have a real verdict)
+                      #    ERROR/anything else -> fail the pipeline (the gate enforcement)
+                      if gate == "NONE":
+                          print("WARNING: no quality gate computed yet (first analysis) - passing this run.")
+                          sys.exit(0)
+                      sys.exit(0 if gate == "OK" else 1)
+    - stage:
+        name: Docker Build
+        identifier: docker_build
+        type: CI
+        strategy:
+          matrix:
+            service:
+              - appointment-service
+              - doctor-service
+              - patient-service
+              - report-service
+              - user-service
+            maxConcurrency: 2
+        spec:
+          cloneCodebase: true
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Docker
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: BuildAndPushDockerRegistry
+                  name: Build and Push Image
+                  identifier: build_push_image
+                  timeout: 25m
+                  spec:
+                    connectorRef: subdenadocker
+                    repo: <+pipeline.variables.docker_repo_namespace>/<+matrix.service>
+                    tags:
+                      - <+pipeline.variables.image_tag>
+                      - ci
+                    dockerfile: healthcare-microservices/<+matrix.service>/Dockerfile
+                    context: healthcare-microservices/<+matrix.service>
+                    caching: true
