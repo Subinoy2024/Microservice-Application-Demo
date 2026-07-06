@@ -25,9 +25,6 @@ pipeline:
     - name: docker_repo_namespace
       type: String
       value: <+input>.default(subinoy2024)
-    - name: image_tag
-      type: String
-      value: build-<+pipeline.sequenceId>
   stages:
     - stage:
         name: Unit Tests
@@ -272,7 +269,7 @@ pipeline:
                     connectorRef: subdenadocker
                     repo: <+pipeline.variables.docker_repo_namespace>/<+matrix.service>
                     tags:
-                      - <+pipeline.variables.image_tag>
+                      - <+pipeline.sequenceId>
                       - ci
                     dockerfile: healthcare-microservices/<+matrix.service>/Dockerfile
                     context: healthcare-microservices/<+matrix.service>
