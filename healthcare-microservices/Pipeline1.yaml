@@ -24,7 +24,7 @@ pipeline:
       value: <+input>.default(subinoy2024)
     - name: docker_repo_namespace
       type: String
-      value: <+input>.default(subinoy2024)
+      value: <+input>.default(subdebna)
   stages:
     - stage:
         name: Unit Tests
