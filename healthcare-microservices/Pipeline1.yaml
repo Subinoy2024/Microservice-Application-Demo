@@ -27,7 +27,7 @@ pipeline:
       value: <+input>.default(subinoy2024)
     - name: image_tag
       type: String
-      value: <+pipeline.sequenceId>-<+codebase.shortCommitSha>
+      value: build-<+pipeline.sequenceId>
   stages:
     - stage:
         name: Unit Tests
